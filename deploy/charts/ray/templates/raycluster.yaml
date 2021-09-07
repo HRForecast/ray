@@ -59,6 +59,13 @@ spec:
             volumeMounts:
             - mountPath: /dev/shm
               name: dshm
+            env:
+            {{- include "helpers.list-env-variables" $ | indent 12 }}
+            {{- if $.Values.env.existingSecret }}
+            envFrom:
+            - secretRef:
+                name: {{ $.Values.env.existingSecret }}
+            {{- end }}
             resources:
               requests:
                 cpu: {{ .CPU }}
