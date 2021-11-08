@@ -24,7 +24,7 @@ class MockTaskFinisherInterface : public TaskFinisherInterface {
                const rpc::Address &actor_addr),
               (override));
   MOCK_METHOD(bool, PendingTaskFailed,
-              (const TaskID &task_id, rpc::ErrorType error_type, Status *status,
+              (const TaskID &task_id, rpc::ErrorType error_type, const Status *status,
                const std::shared_ptr<rpc::RayException> &creation_task_exception,
                bool immediately_mark_object_fail),
               (override));
@@ -34,12 +34,12 @@ class MockTaskFinisherInterface : public TaskFinisherInterface {
               (override));
   MOCK_METHOD(bool, MarkTaskCanceled, (const TaskID &task_id), (override));
   MOCK_METHOD(void, MarkPendingTaskFailed,
-              (const TaskID &task_id, const TaskSpecification &spec,
-               rpc::ErrorType error_type,
+              (const TaskSpecification &spec, rpc::ErrorType error_type,
                const std::shared_ptr<rpc::RayException> &creation_task_exception),
               (override));
   MOCK_METHOD(absl::optional<TaskSpecification>, GetTaskSpec, (const TaskID &task_id),
               (const, override));
+  MOCK_METHOD(bool, RetryTaskIfPossible, (const TaskID &task_id), (override));
 };
 
 }  // namespace core

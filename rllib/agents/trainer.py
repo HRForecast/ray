@@ -8,33 +8,39 @@ import os
 import pickle
 import tempfile
 import time
-from typing import Callable, Dict, List, Optional, Type, Union
+from typing import Callable, Dict, List, Optional, Tuple, Type, Union
 
 import ray
 from ray.actor import ActorHandle
 from ray.exceptions import RayError
 from ray.rllib.agents.callbacks import DefaultCallbacks
 from ray.rllib.env.env_context import EnvContext
+from ray.rllib.env.multi_agent_env import MultiAgentEnv
 from ray.rllib.env.utils import gym_env_creator
 from ray.rllib.evaluation.collectors.simple_list_collector import \
     SimpleListCollector
+from ray.rllib.evaluation.episode import Episode
 from ray.rllib.evaluation.metrics import collect_metrics
 from ray.rllib.evaluation.rollout_worker import RolloutWorker
 from ray.rllib.evaluation.worker_set import WorkerSet
+from ray.rllib.execution.replay_buffer import LocalReplayBuffer
 from ray.rllib.models import MODEL_DEFAULTS
 from ray.rllib.policy.policy import Policy, PolicySpec
-from ray.rllib.policy.sample_batch import DEFAULT_POLICY_ID
+from ray.rllib.policy.sample_batch import DEFAULT_POLICY_ID, SampleBatch
 from ray.rllib.utils import deep_update, FilterManager, merge_dicts
-from ray.rllib.utils.annotations import Deprecated, DeveloperAPI, override, \
+from ray.rllib.utils.annotations import DeveloperAPI, override, \
     PublicAPI
 from ray.rllib.utils.debug import update_global_seed_if_necessary
-from ray.rllib.utils.deprecation import deprecation_warning, DEPRECATED_VALUE
-from ray.rllib.utils.framework import try_import_tf, TensorStructType
+from ray.rllib.utils.deprecation import Deprecated, deprecation_warning, \
+    DEPRECATED_VALUE
+from ray.rllib.utils.error import EnvError, ERR_MSG_INVALID_ENV_DESCRIPTOR
+from ray.rllib.utils.framework import try_import_tf
 from ray.rllib.utils.from_config import from_config
 from ray.rllib.utils.multi_agent import check_multi_agent
 from ray.rllib.utils.spaces import space_utils
 from ray.rllib.utils.typing import AgentID, EnvInfoDict, EnvType, EpisodeID, \
-    PartialTrainerConfigDict, PolicyID, ResultDict, TrainerConfigDict
+    PartialTrainerConfigDict, PolicyID, ResultDict, TensorStructType, \
+    TensorType, TrainerConfigDict
 from ray.tune.logger import Logger, UnifiedLogger
 from ray.tune.registry import ENV_CREATOR, register_env, _global_registry
 from ray.tune.resources import Resources
@@ -187,15 +193,17 @@ COMMON_CONFIG: TrainerConfigDict = {
     # Tuple[value1, value2]: Clip at value1 and value2.
     "clip_rewards": None,
     # If True, RLlib will learn entirely inside a normalized action space
-    # (0.0 centered with small stddev; only affecting Box components) and
-    # only unsquash actions (and clip just in case) to the bounds of
-    # env's action space before sending actions back to the env.
+    # (0.0 centered with small stddev; only affecting Box components).
+    # We will unsquash actions (and clip, just in case) to the bounds of
+    # the env's action space before sending actions back to the env.
     "normalize_actions": True,
     # If True, RLlib will clip actions according to the env's bounds
     # before sending them back to the env.
     # TODO: (sven) This option should be obsoleted and always be False.
     "clip_actions": False,
     # Whether to use "rllib" or "deepmind" preprocessors by default
+    # Set to None for using no preprocessor. In this case, the model will have
+    # to handle possibly complex observations from the environment.
     "preprocessor_pref": "deepmind",
 
     # === Debug Settings ===
@@ -222,14 +230,23 @@ COMMON_CONFIG: TrainerConfigDict = {
 
     # === Deep Learning Framework Settings ===
     # tf: TensorFlow (static-graph)
-    # tf2: TensorFlow 2.x (eager)
-    # tfe: TensorFlow eager
+    # tf2: TensorFlow 2.x (eager or traced, if eager_tracing=True)
+    # tfe: TensorFlow eager (or traced, if eager_tracing=True)
     # torch: PyTorch
     "framework": "tf",
-    # Enable tracing in eager mode. This greatly improves performance, but
-    # makes it slightly harder to debug since Python code won't be evaluated
-    # after the initial eager pass. Only possible if framework=tfe.
+    # Enable tracing in eager mode. This greatly improves performance
+    # (speedup ~2x), but makes it slightly harder to debug since Python
+    # code won't be evaluated after the initial eager pass.
+    # Only possible if framework=[tf2|tfe].
     "eager_tracing": False,
+    # Maximum number of tf.function re-traces before a runtime error is raised.
+    # This is to prevent unnoticed retraces of methods inside the
+    # `..._eager_traced` Policy, which could slow down execution by a
+    # factor of 4, without the user noticing what the root cause for this
+    # slowdown could be.
+    # Only necessary for framework=[tf2|tfe].
+    # Set to None to ignore the re-trace count and never throw an error.
+    "eager_max_retraces": 20,
 
     # === Exploration Settings ===
     # Default exploration behavior, iff `explore`=None is passed into
@@ -475,6 +492,20 @@ COMMON_CONFIG: TrainerConfigDict = {
     # Default value None allows overwriting with nested dicts
     "logger_config": None,
 
+    # === API deprecations/simplifications/changes ===
+    # Experimental flag.
+    # If True, TFPolicy will handle more than one loss/optimizer.
+    # Set this to True, if you would like to return more than
+    # one loss term from your `loss_fn` and an equal number of optimizers
+    # from your `optimizer_fn`.
+    # In the future, the default for this will be True.
+    "_tf_policy_handles_more_than_one_loss": False,
+    # Experimental flag.
+    # If True, no (observation) preprocessor will be created and
+    # observations will arrive in model as they are returned by the env.
+    # In the future, the default for this will be True.
+    "_disable_preprocessor_api": False,
+
     # === Deprecated keys ===
     # Uses the sync samples optimizer instead of the multi-gpu one. This is
     # usually slower, but you might want to try it if you run into issues with
@@ -508,19 +539,34 @@ def with_common_config(
 
 @PublicAPI
 class Trainer(Trainable):
-    """A trainer coordinates the optimization of one or more RL policies.
+    """An RLlib algorithm responsible for optimizing one or more Policies.
 
-    All RLlib trainers extend this base class, e.g., the A3CTrainer implements
-    the A3C algorithm for single and multi-agent training.
+    Trainers contain a WorkerSet under `self.workers`. A WorkerSet is
+    normally composed of a single local worker
+    (self.workers.local_worker()), used to compute and apply learning updates,
+    and optionally one or more remote workers (self.workers.remote_workers()),
+    used to generate environment samples in parallel.
 
-    Trainer objects retain internal model state between calls to train(), so
-    you should create a new trainer instance for each training session.
+    Each worker (remotes or local) contains a PolicyMap, which itself
+    may contain either one policy for single-agent training or one or more
+    policies for multi-agent training. Policies are synchronized
+    automatically from time to time using ray.remote calls. The exact
+    synchronization logic depends on the specific algorithm (Trainer) used,
+    but this usually happens from local worker to all remote workers and
+    after each training update.
 
-    Attributes:
-        env_creator (func): Function that creates a new training env.
-        config (obj): Algorithm-specific configuration data.
-        logdir (str): Directory in which training outputs should be placed.
+    You can write your own Trainer sub-classes by using the
+    rllib.agents.trainer_template.py::build_trainer() utility function.
+    This allows you to provide a custom `execution_plan`. You can find the
+    different built-in algorithms' execution plans in their respective main
+    py files, e.g. rllib.agents.dqn.dqn.py or rllib.agents.impala.impala.py.
+
+    The most important API methods a Trainer exposes are `train()`,
+    `evaluate()`, `save()` and `restore()`. Trainer objects retain internal
+    model state between calls to train(), so you should create a new
+    Trainer instance for each training session.
     """
+
     # Whether to allow unknown top-level config keys.
     _allow_unknown_configs = False
 
@@ -541,15 +587,18 @@ class Trainer(Trainable):
     @PublicAPI
     def __init__(self,
                  config: TrainerConfigDict = None,
-                 env: str = None,
+                 env: Union[str, EnvType, None] = None,
                  logger_creator: Callable[[], Logger] = None):
-        """Initialize an RLLib trainer.
+        """Initializes a Trainer instance.
 
         Args:
-            config (dict): Algorithm-specific configuration data.
-            env (str): Name of the environment to use. Note that this can also
-                be specified as the `env` key in config.
-            logger_creator (func): Function that creates a ray.tune.Logger
+            config: Algorithm-specific configuration dict.
+            env: Name of the environment to use (e.g. a gym-registered str),
+                a full class path (e.g.
+                "ray.rllib.examples.env.random_env.RandomEnv"), or an Env
+                class directly. Note that this arg can also be specified via
+                the "env" key in `config`.
+            logger_creator: Callable that creates a ray.tune.Logger
                 object. If unspecified, a default logger is created.
         """
 
@@ -602,128 +651,69 @@ class Trainer(Trainable):
 
         super().__init__(config, logger_creator)
 
-    @classmethod
-    @override(Trainable)
-    def default_resource_request(
-            cls, config: PartialTrainerConfigDict) -> \
-            Union[Resources, PlacementGroupFactory]:
-        cf = dict(cls._default_config, **config)
-
-        eval_config = cf["evaluation_config"]
-
-        # TODO(ekl): add custom resources here once tune supports them
-        # Return PlacementGroupFactory containing all needed resources
-        # (already properly defined as device bundles).
-        return PlacementGroupFactory(
-            bundles=[{
-                # Driver.
-                "CPU": cf["num_cpus_for_driver"],
-                "GPU": 0 if cf["_fake_gpus"] else cf["num_gpus"],
-            }] + [
-                {
-                    # RolloutWorkers.
-                    "CPU": cf["num_cpus_per_worker"],
-                    "GPU": cf["num_gpus_per_worker"],
-                } for _ in range(cf["num_workers"])
-            ] + ([
-                {
-                    # Evaluation workers.
-                    # Note: The local eval worker is located on the driver CPU.
-                    "CPU": eval_config.get("num_cpus_per_worker",
-                                           cf["num_cpus_per_worker"]),
-                    "GPU": eval_config.get("num_gpus_per_worker",
-                                           cf["num_gpus_per_worker"]),
-                } for _ in range(cf["evaluation_num_workers"])
-            ] if cf["evaluation_interval"] else []),
-            strategy=config.get("placement_strategy", "PACK"))
-
-    @override(Trainable)
-    @PublicAPI
-    def train(self) -> ResultDict:
-        """Overrides super.train to synchronize global vars."""
-
-        result = None
-        for _ in range(1 + MAX_WORKER_FAILURE_RETRIES):
-            try:
-                result = Trainable.train(self)
-            except RayError as e:
-                if self.config["ignore_worker_failures"]:
-                    logger.exception(
-                        "Error in train call, attempting to recover")
-                    self._try_recover()
-                else:
-                    logger.info(
-                        "Worker crashed during call to train(). To attempt to "
-                        "continue training without the failed worker, set "
-                        "`'ignore_worker_failures': True`.")
-                    raise e
-            except Exception as e:
-                time.sleep(0.5)  # allow logs messages to propagate
-                raise e
-            else:
-                break
-        if result is None:
-            raise RuntimeError("Failed to recover from worker crash")
-
-        if hasattr(self, "workers") and isinstance(self.workers, WorkerSet):
-            self._sync_filters_if_needed(self.workers)
-
-        return result
-
-    def _sync_filters_if_needed(self, workers: WorkerSet):
-        if self.config.get("observation_filter", "NoFilter") != "NoFilter":
-            FilterManager.synchronize(
-                workers.local_worker().filters,
-                workers.remote_workers(),
-                update_remote=self.config["synchronize_filters"])
-            logger.debug("synchronized filters: {}".format(
-                workers.local_worker().filters))
-
-    @override(Trainable)
-    def log_result(self, result: ResultDict):
-        self.callbacks.on_train_result(trainer=self, result=result)
-        # log after the callback is invoked, so that the user has a chance
-        # to mutate the result
-        Trainable.log_result(self, result)
-
     @override(Trainable)
     def setup(self, config: PartialTrainerConfigDict):
+
+        # Setup our config: Merge the user-supplied config (which could
+        # be a partial config dict with the class' default).
+        self.config = self.merge_trainer_configs(self._default_config, config,
+                                                 self._allow_unknown_configs)
+
+        # Setup the "env creator" callable.
         env = self._env_id
         if env:
-            config["env"] = env
+            self.config["env"] = env
+
             # An already registered env.
             if _global_registry.contains(ENV_CREATOR, env):
                 self.env_creator = _global_registry.get(ENV_CREATOR, env)
-            # A class specifier.
+
+            # A class path specifier.
             elif "." in env:
-                self.env_creator = \
-                    lambda env_context: from_config(env, env_context)
+
+                def env_creator_from_classpath(env_context):
+                    try:
+                        env_obj = from_config(env, env_context)
+                    except ValueError:
+                        raise EnvError(
+                            ERR_MSG_INVALID_ENV_DESCRIPTOR.format(env))
+                    return env_obj
+
+                self.env_creator = env_creator_from_classpath
             # Try gym/PyBullet/Vizdoom.
             else:
                 self.env_creator = functools.partial(
                     gym_env_creator, env_descriptor=env)
+        # No env -> Env creator always returns None.
         else:
             self.env_creator = lambda env_config: None
 
-        # Merge the supplied config with the class default, but store the
-        # user-provided one.
-        self.raw_user_config = config
-        self.config = self.merge_trainer_configs(self._default_config, config,
-                                                 self._allow_unknown_configs)
-
         # Check and resolve DL framework settings.
-        # Enable eager/tracing support.
+        # Tf-eager (tf2|tfe), possibly with tracing set to True. Recommend
+        # setting tracing to True for speedups.
         if tf1 and self.config["framework"] in ["tf2", "tfe"]:
             if self.config["framework"] == "tf2" and tfv < 2:
-                raise ValueError("`framework`=tf2, but tf-version is < 2.0!")
+                raise ValueError(
+                    "You configured `framework`=tf2, but your installed pip "
+                    "tf-version is < 2.0! Make sure your TensorFlow version "
+                    "is >= 2.x.")
             if not tf1.executing_eagerly():
                 tf1.enable_eager_execution()
-            logger.info("Executing eagerly, with eager_tracing={}".format(
-                self.config["eager_tracing"]))
-        if tf1 and not tf1.executing_eagerly() and \
-                self.config["framework"] != "torch":
-            logger.info("Tip: set framework=tfe or the --eager flag to enable "
-                        "TensorFlow eager execution")
+            logger.info(
+                f"Executing eagerly (framework='{self.config['framework']}'),"
+                f" with eager_tracing={self.config['eager_tracing']}. For "
+                "production workloads, make sure to set eager_tracing=True in"
+                " order to match the speed of tf-static-graph "
+                "(framework='tf')")
+        # Tf-static-graph (framework=tf): Recommend upgrading to tf2 and
+        # enabling eager tracing for similar speed.
+        elif tf1 and self.config["framework"] == "tf":
+            logger.info(
+                "Your framework setting is 'tf', meaning you are using static"
+                "-graph mode. Set framework='tf2' to enable eager execution "
+                "with tf2.x. You may also want to then set eager_tracing=True"
+                " in order to reach similar execution speed as with "
+                "static-graph mode.")
 
         # Set Trainer's seed after we have - if necessary - enabled
         # tf eager-execution.
@@ -745,6 +735,12 @@ class Trainer(Trainable):
         if self.config.get("log_level"):
             logging.getLogger("ray.rllib").setLevel(self.config["log_level"])
 
+        # Create local replay buffer if necessary.
+        self.local_replay_buffer = (
+            self._create_local_replay_buffer_if_necessary(self.config))
+
+        # Make the call to self._init. Sub-classes should override this
+        # method to implement custom initialization logic.
         self._init(self.config, self.env_creator)
 
         # Evaluation setup.
@@ -781,69 +777,53 @@ class Trainer(Trainable):
                 config=evaluation_config,
                 num_workers=self.config["evaluation_num_workers"])
 
-    @override(Trainable)
-    def cleanup(self):
-        if hasattr(self, "workers"):
-            self.workers.stop()
-        if hasattr(self, "optimizer") and self.optimizer:
-            self.optimizer.stop()
-
-    @override(Trainable)
-    def save_checkpoint(self, checkpoint_dir: str) -> str:
-        checkpoint_path = os.path.join(checkpoint_dir,
-                                       "checkpoint-{}".format(self.iteration))
-        pickle.dump(self.__getstate__(), open(checkpoint_path, "wb"))
-
-        return checkpoint_path
-
-    @override(Trainable)
-    def load_checkpoint(self, checkpoint_path: str):
-        extra_data = pickle.load(open(checkpoint_path, "rb"))
-        self.__setstate__(extra_data)
-
-    @DeveloperAPI
-    def _make_workers(
-            self, *, env_creator: Callable[[EnvContext], EnvType],
-            validate_env: Optional[Callable[[EnvType, EnvContext], None]],
-            policy_class: Type[Policy], config: TrainerConfigDict,
-            num_workers: int) -> WorkerSet:
-        """Default factory method for a WorkerSet running under this Trainer.
-
-        Override this method by passing a custom `make_workers` into
-        `build_trainer`.
-
-        Args:
-            env_creator (callable): A function that return and Env given an env
-                config.
-            validate_env (Optional[Callable[[EnvType, EnvContext], None]]):
-                Optional callable to validate the generated environment (only
-                on worker=0).
-            policy (Type[Policy]): The Policy class to use for creating the
-                policies of the workers.
-            config (TrainerConfigDict): The Trainer's config.
-            num_workers (int): Number of remote rollout workers to create.
-                0 for local only.
-
-        Returns:
-            WorkerSet: The created WorkerSet.
-        """
-        return WorkerSet(
-            env_creator=env_creator,
-            validate_env=validate_env,
-            policy_class=policy_class,
-            trainer_config=config,
-            num_workers=num_workers,
-            logdir=self.logdir)
-
     @DeveloperAPI
     def _init(self, config: TrainerConfigDict,
-              env_creator: Callable[[EnvContext], EnvType]):
-        """Subclasses should override this for custom initialization."""
+              env_creator: Callable[[EnvContext], EnvType]) -> None:
+        """Subclasses should override this for custom initialization.
+
+        In the case of Trainer, this is called from inside `self.setup()`.
+
+        Args:
+            config: Algorithm-specific configuration dict.
+            env_creator: A callable taking an EnvContext as only arg and
+                returning an environment (of any type: e.g. gym.Env, RLlib
+                BaseEnv, MultiAgentEnv, etc..).
+        """
         raise NotImplementedError
 
-    @Deprecated(new="Trainer.evaluate", error=False)
-    def _evaluate(self) -> dict:
-        return self.evaluate()
+    @override(Trainable)
+    @PublicAPI
+    def train(self) -> ResultDict:
+        """Overrides super.train to synchronize global vars."""
+
+        result = None
+        for _ in range(1 + MAX_WORKER_FAILURE_RETRIES):
+            try:
+                result = Trainable.train(self)
+            except RayError as e:
+                if self.config["ignore_worker_failures"]:
+                    logger.exception(
+                        "Error in train call, attempting to recover")
+                    self._try_recover()
+                else:
+                    logger.info(
+                        "Worker crashed during call to train(). To attempt to "
+                        "continue training without the failed worker, set "
+                        "`'ignore_worker_failures': True`.")
+                    raise e
+            except Exception as e:
+                time.sleep(0.5)  # allow logs messages to propagate
+                raise e
+            else:
+                break
+        if result is None:
+            raise RuntimeError("Failed to recover from worker crash")
+
+        if hasattr(self, "workers") and isinstance(self.workers, WorkerSet):
+            self._sync_filters_if_needed(self.workers)
+
+        return result
 
     @PublicAPI
     def evaluate(self, episodes_left_fn: Optional[Callable[[int], int]] = None
@@ -854,10 +834,10 @@ class Trainer(Trainable):
         merging evaluation_config with the normal trainer config.
 
         Args:
-            episodes_left_fn (Optional[Callable[[int], int]]): An optional
-                callable taking the already run num episodes as only arg
-                and returning the number of episodes left to run. It's used
-                to find out whether evaluation should continue.
+            episodes_left_fn: An optional callable taking the already run
+                num episodes as only arg and returning the number of
+                episodes left to run. It's used to find out whether
+                evaluation should continue.
         """
         # In case we are evaluating (in a thread) parallel to training,
         # we may have to re-enable eager mode here (gets disabled in the
@@ -869,8 +849,8 @@ class Trainer(Trainable):
         # Call the `_before_evaluate` hook.
         self._before_evaluate()
 
+        # Sync weights to the evaluation WorkerSet.
         if self.evaluation_workers is not None:
-            # Sync weights to the evaluation WorkerSet.
             self._sync_weights_to_workers(worker_set=self.evaluation_workers)
             self._sync_filters_if_needed(self.evaluation_workers)
 
@@ -959,39 +939,32 @@ class Trainer(Trainable):
                     self.evaluation_workers.remote_workers())
         return {"evaluation": metrics}
 
-    @DeveloperAPI
-    def _before_evaluate(self):
-        """Pre-evaluation callback."""
-        pass
-
-    @DeveloperAPI
-    def _sync_weights_to_workers(
-            self,
-            *,
-            worker_set: Optional[WorkerSet] = None,
-            workers: Optional[List[RolloutWorker]] = None,
-    ) -> None:
-        """Sync "main" weights to given WorkerSet or list of workers."""
-        assert worker_set is not None
-        # Broadcast the new policy weights to all evaluation workers.
-        logger.info("Synchronizing weights to workers.")
-        weights = ray.put(self.workers.local_worker().save())
-        worker_set.foreach_worker(lambda w: w.restore(ray.get(weights)))
-
     @PublicAPI
     def compute_single_action(
             self,
-            observation: TensorStructType,
-            state: List[TensorStructType] = None,
-            prev_action: TensorStructType = None,
-            prev_reward: float = None,
-            info: EnvInfoDict = None,
+            observation: Optional[TensorStructType] = None,
+            state: Optional[List[TensorStructType]] = None,
+            *,
+            prev_action: Optional[TensorStructType] = None,
+            prev_reward: Optional[float] = None,
+            info: Optional[EnvInfoDict] = None,
+            input_dict: Optional[SampleBatch] = None,
             policy_id: PolicyID = DEFAULT_POLICY_ID,
             full_fetch: bool = False,
-            explore: bool = None,
-            unsquash_actions: Optional[bool] = None,
-            clip_actions: Optional[bool] = None,
-    ) -> TensorStructType:
+            explore: Optional[bool] = None,
+            timestep: Optional[int] = None,
+            episode: Optional[Episode] = None,
+            unsquash_action: Optional[bool] = None,
+            clip_action: Optional[bool] = None,
+
+            # Deprecated args.
+            unsquash_actions=DEPRECATED_VALUE,
+            clip_actions=DEPRECATED_VALUE,
+
+            # Kwargs placeholder for future compatibility.
+            **kwargs,
+    ) -> Union[TensorStructType, Tuple[TensorStructType, List[TensorType],
+                                       Dict[str, TensorType]]]:
         """Computes an action for the specified policy on the local worker.
 
         Note that you can also access the policy object through
@@ -999,88 +972,143 @@ class Trainer(Trainable):
         directly.
 
         Args:
-            observation (TensorStructType): observation from the environment.
-            state (List[TensorStructType]): RNN hidden state, if any. If state
-                is not None, then all of compute_single_action(...) is returned
-                (computed action, rnn state(s), logits dictionary).
-                Otherwise compute_single_action(...)[0] is returned
-                (computed action).
-            prev_action (TensorStructType): Previous action value, if any.
-            prev_reward (float): Previous reward, if any.
-            info (EnvInfoDict): info object, if any
-            policy_id (PolicyID): Policy to query (only applies to
-                multi-agent).
-            full_fetch (bool): Whether to return extra action fetch results.
-                This is always set to True if RNN state is specified.
-            explore (bool): Whether to pick an exploitation or exploration
-                action (default: None -> use self.config["explore"]).
-            unsquash_actions (bool): Should actions be unsquashed according to
-                 the env's/Policy's action space?
-            clip_actions (bool): Should actions be clipped according to the
-                env's/Policy's action space?
+            observation: Single (unbatched) observation from the
+                environment.
+            state: List of all RNN hidden (single, unbatched) state tensors.
+            prev_action: Single (unbatched) previous action value.
+            prev_reward: Single (unbatched) previous reward value.
+            info: Env info dict, if any.
+            input_dict: An optional SampleBatch that holds all the values
+                for: obs, state, prev_action, and prev_reward, plus maybe
+                custom defined views of the current env trajectory. Note
+                that only one of `obs` or `input_dict` must be non-None.
+            policy_id: Policy to query (only applies to multi-agent).
+                Default: "default_policy".
+            full_fetch: Whether to return extra action fetch results.
+                This is always set to True if `state` is specified.
+            explore: Whether to apply exploration to the action.
+                Default: None -> use self.config["explore"].
+            timestep: The current (sampling) time step.
+            episode: This provides access to all of the internal episodes'
+                state, which may be useful for model-based or multi-agent
+                algorithms.
+            unsquash_action: Should actions be unsquashed according to the
+                env's/Policy's action space? If None, use the value of
+                self.config["normalize_actions"].
+            clip_action: Should actions be clipped according to the
+                env's/Policy's action space? If None, use the value of
+                self.config["clip_actions"].
+
+        Keyword Args:
+            kwargs: forward compatibility placeholder
 
         Returns:
-            any: The computed action if full_fetch=False, or
-            tuple: The full output of policy.compute_actions() if
-                full_fetch=True or we have an RNN-based Policy.
+            The computed action if full_fetch=False, or a tuple of a) the
+                full output of policy.compute_actions() if full_fetch=True
+                or we have an RNN-based Policy.
 
         Raises:
             KeyError: If the `policy_id` cannot be found in this Trainer's
                 local worker.
         """
+        if clip_actions != DEPRECATED_VALUE:
+            deprecation_warning(
+                old="Trainer.compute_single_action(`clip_actions`=...)",
+                new="Trainer.compute_single_action(`clip_action`=...)",
+                error=False)
+            clip_action = clip_actions
+        if unsquash_actions != DEPRECATED_VALUE:
+            deprecation_warning(
+                old="Trainer.compute_single_action(`unsquash_actions`=...)",
+                new="Trainer.compute_single_action(`unsquash_action`=...)",
+                error=False)
+            unsquash_action = unsquash_actions
+
+        # User provided an input-dict: Assert that `obs`, `prev_a|r`, `state`
+        # are all None.
+        err_msg = "Provide either `input_dict` OR [`observation`, ...] as " \
+                  "args to Trainer.compute_single_action!"
+        if input_dict is not None:
+            assert observation is None and prev_action is None and \
+                   prev_reward is None and state is None, err_msg
+            observation = input_dict[SampleBatch.OBS]
+        else:
+            assert observation is not None, err_msg
+
+        # Get the policy to compute the action for (in the multi-agent case,
+        # Trainer may hold >1 policies).
         policy = self.get_policy(policy_id)
         if policy is None:
             raise KeyError(
                 f"PolicyID '{policy_id}' not found in PolicyMap of the "
                 f"Trainer's local worker!")
-
         local_worker = self.workers.local_worker()
-
-        if state is None:
-            state = []
 
         # Check the preprocessor and preprocess, if necessary.
         pp = local_worker.preprocessors[policy_id]
-        if type(pp).__name__ != "NoPreprocessor":
+        if pp and type(pp).__name__ != "NoPreprocessor":
             observation = pp.transform(observation)
-        filtered_observation = local_worker.filters[policy_id](
+        observation = local_worker.filters[policy_id](
             observation, update=False)
 
-        # Compute the action.
-        result = policy.compute_single_action(
-            filtered_observation,
-            state,
-            prev_action,
-            prev_reward,
-            info,
-            unsquash_actions=unsquash_actions,
-            clip_actions=clip_actions,
-            explore=explore)
+        # Input-dict.
+        if input_dict is not None:
+            input_dict[SampleBatch.OBS] = observation
+            action, state, extra = policy.compute_single_action(
+                input_dict=input_dict,
+                explore=explore,
+                timestep=timestep,
+                episode=episode,
+            )
+        # Individual args.
+        else:
+            action, state, extra = policy.compute_single_action(
+                obs=observation,
+                state=state,
+                prev_action=prev_action,
+                prev_reward=prev_reward,
+                info=info,
+                explore=explore,
+                timestep=timestep,
+                episode=episode,
+            )
+
+        # If we work in normalized action space (normalize_actions=True),
+        # we re-translate here into the env's action space.
+        if unsquash_action:
+            action = space_utils.unsquash_action(action,
+                                                 policy.action_space_struct)
+        # Clip, according to env's action space.
+        elif clip_action:
+            action = space_utils.clip_action(action,
+                                             policy.action_space_struct)
 
         # Return 3-Tuple: Action, states, and extra-action fetches.
         if state or full_fetch:
-            return result
+            return action, state, extra
         # Ensure backward compatibility.
         else:
-            return result[0]
-
-    @Deprecated(new="compute_single_action", error=False)
-    def compute_action(self, *args, **kwargs):
-        return self.compute_single_action(*args, **kwargs)
+            return action
 
     @PublicAPI
     def compute_actions(
             self,
             observations: TensorStructType,
-            state: List[TensorStructType] = None,
-            prev_action: TensorStructType = None,
-            prev_reward: TensorStructType = None,
-            info=None,
-            policy_id=DEFAULT_POLICY_ID,
-            full_fetch=False,
-            explore=None,
+            state: Optional[List[TensorStructType]] = None,
+            *,
+            prev_action: Optional[TensorStructType] = None,
+            prev_reward: Optional[TensorStructType] = None,
+            info: Optional[EnvInfoDict] = None,
+            policy_id: PolicyID = DEFAULT_POLICY_ID,
+            full_fetch: bool = False,
+            explore: Optional[bool] = None,
+            timestep: Optional[int] = None,
+            episodes: Optional[List[Episode]] = None,
+            unsquash_actions: Optional[bool] = None,
+            clip_actions: Optional[bool] = None,
+            # Deprecated.
             normalize_actions=None,
-            clip_actions=None,
+            **kwargs,
     ):
         """Computes an action for the specified policy on the local Worker.
 
@@ -1088,32 +1116,48 @@ class Trainer(Trainable):
         self.get_policy(policy_id) and call compute_actions() on it directly.
 
         Args:
-            observation (obj): observation from the environment.
-            state (dict): RNN hidden state, if any. If state is not None,
+            observation: Observation from the environment.
+            state: RNN hidden state, if any. If state is not None,
                 then all of compute_single_action(...) is returned
                 (computed action, rnn state(s), logits dictionary).
                 Otherwise compute_single_action(...)[0] is returned
                 (computed action).
-            prev_action (obj): previous action value, if any
-            prev_reward (int): previous reward, if any
-            info (dict): info object, if any
-            policy_id (str): Policy to query (only applies to multi-agent).
-            full_fetch (bool): Whether to return extra action fetch results.
+            prev_action: Previous action value, if any.
+            prev_reward: Previous reward, if any.
+            info: Env info dict, if any.
+            policy_id: Policy to query (only applies to multi-agent).
+            full_fetch: Whether to return extra action fetch results.
                 This is always set to True if RNN state is specified.
-            explore (bool): Whether to pick an exploitation or exploration
+            explore: Whether to pick an exploitation or exploration
                 action (default: None -> use self.config["explore"]).
-            normalize_actions (bool): Should actions be unsquashed according
-                to the env's/Policy's action space?
-            clip_actions (bool): Should actions be clipped according to the
-                env's/Policy's action space?
+            timestep: The current (sampling) time step.
+            episodes: This provides access to all of the internal episodes'
+                state, which may be useful for model-based or multi-agent
+                algorithms.
+            unsquash_actions: Should actions be unsquashed according
+                to the env's/Policy's action space? If None, use
+                self.config["normalize_actions"].
+            clip_actions: Should actions be clipped according to the
+                env's/Policy's action space? If None, use
+                self.config["clip_actions"].
+
+        Keyword Args:
+            kwargs: forward compatibility placeholder
 
         Returns:
             any: The computed action if full_fetch=False, or
             tuple: The full output of policy.compute_actions() if
-                full_fetch=True or we have an RNN-based Policy.
+            full_fetch=True or we have an RNN-based Policy.
         """
-        # Preprocess obs and states
-        stateDefined = state is not None
+        if normalize_actions is not None:
+            deprecation_warning(
+                old="Trainer.compute_actions(`normalize_actions`=...)",
+                new="Trainer.compute_actions(`unsquash_actions`=...)",
+                error=False)
+            unsquash_actions = normalize_actions
+
+        # Preprocess obs and states.
+        state_defined = state is not None
         policy = self.get_policy(policy_id)
         filtered_obs, filtered_state = [], []
         for agent_id, ob in observations.items():
@@ -1136,58 +1180,63 @@ class Trainer(Trainable):
             state = list(zip(*filtered_state))
             state = [np.stack(s) for s in state]
 
+        input_dict = {SampleBatch.OBS: obs_batch}
+        if prev_action:
+            input_dict[SampleBatch.PREV_ACTIONS] = prev_action
+        if prev_reward:
+            input_dict[SampleBatch.PREV_REWARDS] = prev_reward
+        if info:
+            input_dict[SampleBatch.INFOS] = info
+        for i, s in enumerate(state):
+            input_dict[f"state_in_{i}"] = s
+
         # Batch compute actions
-        actions, states, infos = policy.compute_actions(
-            obs_batch,
-            state,
-            prev_action,
-            prev_reward,
-            info,
-            normalize_actions=normalize_actions,
-            clip_actions=clip_actions,
-            explore=explore)
+        actions, states, infos = policy.compute_actions_from_input_dict(
+            input_dict=input_dict,
+            explore=explore,
+            timestep=timestep,
+            episodes=episodes,
+        )
 
-        # Unbatch actions for the environment
-        atns, actions = space_utils.unbatch(actions), {}
-        for key, atn in zip(observations, atns):
-            actions[key] = atn
+        # Unbatch actions for the environment into a multi-agent dict.
+        single_actions = space_utils.unbatch(actions)
+        actions = {}
+        for key, a in zip(observations, single_actions):
+            # If we work in normalized action space (normalize_actions=True),
+            # we re-translate here into the env's action space.
+            if unsquash_actions:
+                a = space_utils.unsquash_action(a, policy.action_space_struct)
+            # Clip, according to env's action space.
+            elif clip_actions:
+                a = space_utils.clip_action(a, policy.action_space_struct)
+            actions[key] = a
 
-        # Unbatch states into a dict
+        # Unbatch states into a multi-agent dict.
         unbatched_states = {}
         for idx, agent_id in enumerate(observations):
             unbatched_states[agent_id] = [s[idx] for s in states]
 
         # Return only actions or full tuple
-        if stateDefined or full_fetch:
+        if state_defined or full_fetch:
             return actions, unbatched_states, infos
         else:
             return actions
-
-    @property
-    def _name(self) -> str:
-        """Subclasses should override this to declare their name."""
-        raise NotImplementedError
-
-    @property
-    def _default_config(self) -> TrainerConfigDict:
-        """Subclasses should override this to declare their default config."""
-        raise NotImplementedError
 
     @PublicAPI
     def get_policy(self, policy_id: PolicyID = DEFAULT_POLICY_ID) -> Policy:
         """Return policy for the specified id, or None.
 
         Args:
-            policy_id (PolicyID): ID of the policy to return.
+            policy_id: ID of the policy to return.
         """
         return self.workers.local_worker().get_policy(policy_id)
 
     @PublicAPI
-    def get_weights(self, policies: List[PolicyID] = None) -> dict:
+    def get_weights(self, policies: Optional[List[PolicyID]] = None) -> dict:
         """Return a dictionary of policy ids to weights.
 
         Args:
-            policies (list): Optional list of policies to return weights for,
+            policies: Optional list of policies to return weights for,
                 or None for all policies.
         """
         return self.workers.local_worker().get_weights(policies)
@@ -1197,7 +1246,7 @@ class Trainer(Trainable):
         """Set policy weights by policy id.
 
         Args:
-            weights (dict): Map of policy ids to weights to set.
+            weights: Map of policy ids to weights to set.
         """
         self.workers.local_worker().set_weights(weights)
 
@@ -1213,6 +1262,7 @@ class Trainer(Trainable):
             policy_mapping_fn: Optional[Callable[[AgentID, EpisodeID],
                                                  PolicyID]] = None,
             policies_to_train: Optional[List[PolicyID]] = None,
+            evaluation_workers: bool = True,
     ) -> Policy:
         """Adds a new policy to this Trainer.
 
@@ -1235,6 +1285,8 @@ class Trainer(Trainable):
                 policy IDs to be trained. If None, will keep the existing list
                 in place. Policies, whose IDs are not in the list will not be
                 updated.
+            evaluation_workers (bool): Whether to add the new policy also
+                to the evaluation WorkerSet.
 
         Returns:
             Policy: The newly added policy (the copy that got added to the
@@ -1256,7 +1308,7 @@ class Trainer(Trainable):
 
         # Run foreach_worker fn on all workers (incl. evaluation workers).
         self.workers.foreach_worker(fn)
-        if self.evaluation_workers is not None:
+        if evaluation_workers and self.evaluation_workers is not None:
             self.evaluation_workers.foreach_worker(fn)
 
         # Return newly added policy (from the local rollout worker).
@@ -1269,6 +1321,7 @@ class Trainer(Trainable):
             *,
             policy_mapping_fn: Optional[Callable[[AgentID], PolicyID]] = None,
             policies_to_train: Optional[List[PolicyID]] = None,
+            evaluation_workers: bool = True,
     ) -> None:
         """Removes a new policy from this Trainer.
 
@@ -1283,6 +1336,8 @@ class Trainer(Trainable):
                 policy IDs to be trained. If None, will keep the existing list
                 in place. Policies, whose IDs are not in the list will not be
                 updated.
+            evaluation_workers (bool): Whether to also remove the policy from
+                the evaluation WorkerSet.
         """
 
         def fn(worker):
@@ -1293,42 +1348,45 @@ class Trainer(Trainable):
             )
 
         self.workers.foreach_worker(fn)
-        if self.evaluation_workers is not None:
+        if evaluation_workers and self.evaluation_workers is not None:
             self.evaluation_workers.foreach_worker(fn)
 
     @DeveloperAPI
     def export_policy_model(self,
                             export_dir: str,
                             policy_id: PolicyID = DEFAULT_POLICY_ID,
-                            onnx: Optional[int] = None):
-        """Export policy model with given policy_id to local directory.
+                            onnx: Optional[int] = None) -> None:
+        """Exports policy model with given policy_id to a local directory.
 
         Args:
-            export_dir (string): Writable local directory.
-            policy_id (string): Optional policy id to export.
-            onnx (int): If given, will export model in ONNX format. The
+            export_dir: Writable local directory.
+            policy_id: Optional policy id to export.
+            onnx: If given, will export model in ONNX format. The
                 value of this parameter set the ONNX OpSet version to use.
+                If None, the output format will be DL framework specific.
 
         Example:
             >>> trainer = MyTrainer()
             >>> for _ in range(10):
             >>>     trainer.train()
-            >>> trainer.export_policy_model("/tmp/export_dir")
+            >>> trainer.export_policy_model("/tmp/dir")
+            >>> trainer.export_policy_model("/tmp/dir/onnx", onnx=1)
         """
-        self.workers.local_worker().export_policy_model(
-            export_dir, policy_id, onnx)
+        self.get_policy(policy_id).export_model(export_dir, onnx)
 
     @DeveloperAPI
-    def export_policy_checkpoint(self,
-                                 export_dir: str,
-                                 filename_prefix: str = "model",
-                                 policy_id: PolicyID = DEFAULT_POLICY_ID):
-        """Export tensorflow policy model checkpoint to local directory.
+    def export_policy_checkpoint(
+            self,
+            export_dir: str,
+            filename_prefix: str = "model",
+            policy_id: PolicyID = DEFAULT_POLICY_ID,
+    ) -> None:
+        """Exports policy model checkpoint to a local directory.
 
         Args:
-            export_dir (string): Writable local directory.
-            filename_prefix (string): file name prefix of checkpoint files.
-            policy_id (string): Optional policy id to export.
+            export_dir: Writable local directory.
+            filename_prefix: file name prefix of checkpoint files.
+            policy_id: Optional policy id to export.
 
         Example:
             >>> trainer = MyTrainer()
@@ -1336,18 +1394,20 @@ class Trainer(Trainable):
             >>>     trainer.train()
             >>> trainer.export_policy_checkpoint("/tmp/export_dir")
         """
-        self.workers.local_worker().export_policy_checkpoint(
-            export_dir, filename_prefix, policy_id)
+        self.get_policy(policy_id).export_checkpoint(export_dir,
+                                                     filename_prefix)
 
     @DeveloperAPI
-    def import_policy_model_from_h5(self,
-                                    import_file: str,
-                                    policy_id: PolicyID = DEFAULT_POLICY_ID):
+    def import_policy_model_from_h5(
+            self,
+            import_file: str,
+            policy_id: PolicyID = DEFAULT_POLICY_ID,
+    ) -> None:
         """Imports a policy's model with given policy_id from a local h5 file.
 
         Args:
-            import_file (str): The h5 file to import from.
-            policy_id (string): Optional policy id to import into.
+            import_file: The h5 file to import from.
+            policy_id: Optional policy id to import into.
 
         Example:
             >>> trainer = MyTrainer()
@@ -1355,8 +1415,9 @@ class Trainer(Trainable):
             >>> for _ in range(10):
             >>>     trainer.train()
         """
-        self.workers.local_worker().import_policy_model_from_h5(
-            import_file, policy_id)
+        self.get_policy(policy_id).import_model_from_h5(import_file)
+        # Sync new weights to remote workers.
+        self._sync_weights_to_workers(worker_set=self.workers)
 
     @DeveloperAPI
     def collect_metrics(self,
@@ -1370,7 +1431,158 @@ class Trainer(Trainable):
             min_history=self.config["metrics_smoothing_episodes"],
             selected_workers=selected_workers)
 
+    @override(Trainable)
+    def save_checkpoint(self, checkpoint_dir: str) -> str:
+        checkpoint_path = os.path.join(checkpoint_dir,
+                                       "checkpoint-{}".format(self.iteration))
+        pickle.dump(self.__getstate__(), open(checkpoint_path, "wb"))
+
+        return checkpoint_path
+
+    @override(Trainable)
+    def load_checkpoint(self, checkpoint_path: str) -> None:
+        extra_data = pickle.load(open(checkpoint_path, "rb"))
+        self.__setstate__(extra_data)
+
+    @override(Trainable)
+    def log_result(self, result: ResultDict) -> None:
+        # Log after the callback is invoked, so that the user has a chance
+        # to mutate the result.
+        self.callbacks.on_train_result(trainer=self, result=result)
+        # Then log according to Trainable's logging logic.
+        Trainable.log_result(self, result)
+
+    @override(Trainable)
+    def cleanup(self) -> None:
+        # Stop all workers.
+        if hasattr(self, "workers"):
+            self.workers.stop()
+        # Stop all optimizers.
+        if hasattr(self, "optimizer") and self.optimizer:
+            self.optimizer.stop()
+
     @classmethod
+    @override(Trainable)
+    def default_resource_request(
+            cls, config: PartialTrainerConfigDict) -> \
+            Union[Resources, PlacementGroupFactory]:
+
+        # Default logic for RLlib algorithms (Trainers):
+        # Create one bundle per individual worker (local or remote).
+        # Use `num_cpus_for_driver` and `num_gpus` for the local worker and
+        # `num_cpus_per_worker` and `num_gpus_per_worker` for the remote
+        # workers to determine their CPU/GPU resource needs.
+
+        # Convenience config handles.
+        cf = dict(cls._default_config, **config)
+        eval_cf = cf["evaluation_config"]
+
+        # TODO(ekl): add custom resources here once tune supports them
+        # Return PlacementGroupFactory containing all needed resources
+        # (already properly defined as device bundles).
+        return PlacementGroupFactory(
+            bundles=[{
+                # Local worker.
+                "CPU": cf["num_cpus_for_driver"],
+                "GPU": 0 if cf["_fake_gpus"] else cf["num_gpus"],
+            }] + [
+                {
+                    # RolloutWorkers.
+                    "CPU": cf["num_cpus_per_worker"],
+                    "GPU": cf["num_gpus_per_worker"],
+                } for _ in range(cf["num_workers"])
+            ] + ([
+                {
+                    # Evaluation workers.
+                    # Note: The local eval worker is located on the driver CPU.
+                    "CPU": eval_cf.get("num_cpus_per_worker",
+                                       cf["num_cpus_per_worker"]),
+                    "GPU": eval_cf.get("num_gpus_per_worker",
+                                       cf["num_gpus_per_worker"]),
+                } for _ in range(cf["evaluation_num_workers"])
+            ] if cf["evaluation_interval"] else []),
+            strategy=config.get("placement_strategy", "PACK"))
+
+    @DeveloperAPI
+    def _before_evaluate(self):
+        """Pre-evaluation callback."""
+        pass
+
+    @DeveloperAPI
+    def _make_workers(
+            self,
+            *,
+            env_creator: Callable[[EnvContext], EnvType],
+            validate_env: Optional[Callable[[EnvType, EnvContext], None]],
+            policy_class: Type[Policy],
+            config: TrainerConfigDict,
+            num_workers: int,
+    ) -> WorkerSet:
+        """Default factory method for a WorkerSet running under this Trainer.
+
+        Override this method by passing a custom `make_workers` into
+        `build_trainer`.
+
+        Args:
+            env_creator: A function that return and Env given an env
+                config.
+            validate_env: Optional callable to validate the generated
+                environment. The env to be checked is the one returned from
+                the env creator, which may be a (single, not-yet-vectorized)
+                gym.Env or your custom RLlib env type (e.g. MultiAgentEnv,
+                VectorEnv, BaseEnv, etc..).
+            policy_class: The Policy class to use for creating the policies
+                of the workers.
+            config: The Trainer's config.
+            num_workers: Number of remote rollout workers to create.
+                0 for local only.
+
+        Returns:
+            The created WorkerSet.
+        """
+        return WorkerSet(
+            env_creator=env_creator,
+            validate_env=validate_env,
+            policy_class=policy_class,
+            trainer_config=config,
+            num_workers=num_workers,
+            logdir=self.logdir)
+
+    def _sync_filters_if_needed(self, workers: WorkerSet):
+        if self.config.get("observation_filter", "NoFilter") != "NoFilter":
+            FilterManager.synchronize(
+                workers.local_worker().filters,
+                workers.remote_workers(),
+                update_remote=self.config["synchronize_filters"])
+            logger.debug("synchronized filters: {}".format(
+                workers.local_worker().filters))
+
+    @DeveloperAPI
+    def _sync_weights_to_workers(
+            self,
+            *,
+            worker_set: Optional[WorkerSet] = None,
+            workers: Optional[List[RolloutWorker]] = None,
+    ) -> None:
+        """Sync "main" weights to given WorkerSet or list of workers."""
+        assert worker_set is not None
+        # Broadcast the new policy weights to all evaluation workers.
+        logger.info("Synchronizing weights to workers.")
+        weights = ray.put(self.workers.local_worker().save())
+        worker_set.foreach_worker(lambda w: w.restore(ray.get(weights)))
+
+    @property
+    def _name(self) -> str:
+        """Subclasses should override this to declare their name."""
+        raise NotImplementedError
+
+    @property
+    def _default_config(self) -> TrainerConfigDict:
+        """Subclasses should override this to declare their default config."""
+        raise NotImplementedError
+
+    @classmethod
+    @override(Trainable)
     def resource_help(cls, config: TrainerConfigDict) -> str:
         return ("\n\nYou can adjust the resource requests of RLlib agents by "
                 "setting `num_workers`, `num_gpus`, and other configs. See "
@@ -1505,6 +1717,12 @@ class Trainer(Trainable):
                     config["input_evaluation"]))
 
         # Check model config.
+        # If no preprocessing, propagate into model's config as well
+        # (so model will know, whether inputs are preprocessed or not).
+        if config["_disable_preprocessor_api"] is True:
+            model_config["_disable_preprocessor_api"] = True
+
+        # Prev_a/r settings.
         prev_a_r = model_config.get("lstm_use_prev_action_reward",
                                     DEPRECATED_VALUE)
         if prev_a_r != DEPRECATED_VALUE:
@@ -1604,7 +1822,8 @@ class Trainer(Trainable):
 
         logger.warning("Recreating execution plan after failure")
         workers.reset(healthy_workers)
-        self.train_exec_impl = self.execution_plan(workers, self.config)
+        self.train_exec_impl = self.execution_plan(
+            workers, self.config, **self._kwargs_for_execution_plan())
 
     @override(Trainable)
     def _export_model(self, export_formats: List[str],
@@ -1699,26 +1918,91 @@ class Trainer(Trainable):
             "that were generated via the `ray.rllib.agents.trainer_template."
             "build_trainer()` function!")
 
+    @DeveloperAPI
+    def _create_local_replay_buffer_if_necessary(
+            self,
+            config: PartialTrainerConfigDict) -> Optional[LocalReplayBuffer]:
+        """Create a LocalReplayBuffer instance if necessary.
+
+        Args:
+            config: Algorithm-specific configuration data.
+
+        Returns:
+            LocalReplayBuffer instance based on trainer config.
+            None, if local replay buffer is not needed.
+        """
+        # These are the agents that utilizes a local replay buffer.
+        if ("replay_buffer_config" not in config
+                or not config["replay_buffer_config"]):
+            # Does not need a replay buffer.
+            return None
+
+        replay_buffer_config = config["replay_buffer_config"]
+        if ("type" not in replay_buffer_config
+                or replay_buffer_config["type"] != "LocalReplayBuffer"):
+            # DistributedReplayBuffer coming soon.
+            return None
+
+        capacity = config.get("buffer_size", DEPRECATED_VALUE)
+        if capacity != DEPRECATED_VALUE:
+            # Print a deprecation warning.
+            deprecation_warning(
+                old="config['buffer_size']",
+                new="config['replay_buffer_config']['capacity']",
+                error=False)
+        else:
+            # Get capacity out of replay_buffer_config.
+            capacity = replay_buffer_config["capacity"]
+
+        if config.get("prioritized_replay"):
+            prio_args = {
+                "prioritized_replay_alpha": config["prioritized_replay_alpha"],
+                "prioritized_replay_beta": config["prioritized_replay_beta"],
+                "prioritized_replay_eps": config["prioritized_replay_eps"],
+            }
+        else:
+            prio_args = {}
+
+        return LocalReplayBuffer(
+            num_shards=1,
+            learning_starts=config["learning_starts"],
+            capacity=capacity,
+            replay_batch_size=config["train_batch_size"],
+            replay_mode=config["multiagent"]["replay_mode"],
+            replay_sequence_length=config.get("replay_sequence_length", 1),
+            replay_burn_in=config.get("burn_in", 0),
+            replay_zero_init_states=config.get("zero_init_states", True),
+            **prio_args)
+
+    @DeveloperAPI
+    def _kwargs_for_execution_plan(self):
+        kwargs = {}
+        if self.local_replay_buffer:
+            kwargs["local_replay_buffer"] = self.local_replay_buffer
+        return kwargs
+
     def _register_if_needed(self, env_object: Union[str, EnvType, None],
-                            config):
+                            config) -> Optional[str]:
         if isinstance(env_object, str):
             return env_object
         elif isinstance(env_object, type):
             name = env_object.__name__
 
-            # Add convenience `_get_spaces` method.
-
-            def _get_spaces(s):
-                return s.observation_space, s.action_space
-
-            env_object._get_spaces = _get_spaces
-
             if config.get("remote_worker_envs"):
-                register_env(
-                    name,
-                    lambda cfg: ray.remote(num_cpus=0)(env_object).remote(cfg))
+
+                @ray.remote(num_cpus=0)
+                class _wrapper(env_object):
+                    # Add convenience `_get_spaces` and `_is_multi_agent`
+                    # methods.
+                    def _get_spaces(self):
+                        return self.observation_space, self.action_space
+
+                    def _is_multi_agent(self):
+                        return isinstance(self, MultiAgentEnv)
+
+                register_env(name, lambda cfg: _wrapper.remote(cfg))
             else:
-                register_env(name, lambda config: env_object(config))
+                register_env(name, lambda cfg: env_object(cfg))
             return name
         elif env_object is None:
             return None
@@ -1726,6 +2010,14 @@ class Trainer(Trainable):
             "{} is an invalid env specification. ".format(env_object) +
             "You can specify a custom env as either a class "
             "(e.g., YourEnvCls) or a registered env id (e.g., \"your_env\").")
+
+    @Deprecated(new="Trainer.evaluate", error=False)
+    def _evaluate(self) -> dict:
+        return self.evaluate()
+
+    @Deprecated(new="compute_single_action", error=False)
+    def compute_action(self, *args, **kwargs):
+        return self.compute_single_action(*args, **kwargs)
 
     def __repr__(self):
         return self._name
